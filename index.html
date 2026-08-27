@@ -6,7 +6,8 @@
 <title>Speed HUD</title>
 <style>
 /* Meta Ray-Ban Display: 600x600 단안 20도.
-   고대비 흑백 기조 = 도파관 가독성 + 배터리 절약. */
+   화면은 기본이 꺼짐(검정)이고 핀치할 때만 3초 켜집니다.
+   도파관은 켜진 픽셀에 비례해 전력을 쓰므로 이게 가장 큰 절전 수단입니다. */
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:#000;color:#fff;overflow:hidden;
   font-family:ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace;
@@ -14,87 +15,76 @@ html,body{height:100%;background:#000;color:#fff;overflow:hidden;
 #app{height:100%;display:flex;flex-direction:column;
   justify-content:space-between;padding:5vmin 5.5vmin}
 
-/* 상단 상태줄 */
+/* 소등 상태 — 완전 검정 */
+#app.dark{visibility:hidden}
+
 .bar{display:flex;justify-content:space-between;align-items:center;
   font-size:3.4vmin;letter-spacing:.08em;color:#7d8a87;min-height:4vmin}
-.bar .sig b{color:#4FD6BE;font-weight:600}
-.bar .sig.weak b{color:#E0A03A}
-.bar .sig.none b{color:#E2705E}
+.bar b{font-weight:600}
+.src.gps b{color:#4FD6BE}
+.src.stride b{color:#E0A03A}
+.src.none b{color:#E2705E}
 
-/* 중앙 거대 숫자 */
 .mid{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:flex-start}
-#val{font-size:23vmin;line-height:.88;font-weight:700;letter-spacing:-.04em;
-  font-variant-numeric:tabular-nums;transition:opacity .12s}
-#val.stale{opacity:.35}
-#unit{font-size:5.2vmin;letter-spacing:.16em;color:#7d8a87;margin-top:1.6vmin;text-transform:uppercase}
+#val{font-size:24vmin;line-height:.88;font-weight:700;letter-spacing:-.04em;
+  font-variant-numeric:tabular-nums}
+#unit{font-size:5.4vmin;letter-spacing:.16em;color:#7d8a87;margin-top:1.6vmin}
 
-/* 하단 보조 지표 */
 .sub{display:grid;grid-template-columns:1fr 1fr;gap:1.2vmin 4vmin;
   font-size:3.6vmin;color:#7d8a87;font-variant-numeric:tabular-nums}
 .sub div{display:flex;justify-content:space-between;gap:2vmin}
 .sub b{color:#fff;font-weight:600}
 
-/* 안내 화면 */
 .card{flex:1;display:flex;flex-direction:column;justify-content:center;gap:2.4vmin}
 .card h1{font-size:7vmin;font-weight:700;letter-spacing:-.02em;line-height:1.1}
-.card p{font-size:4vmin;color:#7d8a87;line-height:1.45}
+.card p{font-size:3.9vmin;color:#7d8a87;line-height:1.45}
 .card .hint{font-size:3.6vmin;color:#4FD6BE}
 .err{color:#E2705E}
-
-/* 도움말 오버레이 */
-#help{position:fixed;inset:0;background:#000;padding:6vmin;display:none;
-  flex-direction:column;justify-content:center;gap:2.2vmin}
-#help.on{display:flex}
-#help div{display:flex;gap:3vmin;font-size:3.9vmin;align-items:baseline}
-#help kbd{color:#4FD6BE;font-weight:700;min-width:26vmin;display:inline-block}
 </style>
 </head>
 <body>
 <div id="app"></div>
-<div id="help">
-  <div><kbd>검지 핀치</kbd><span>시작 / 일시정지</span></div>
-  <div><kbd>← →</kbd><span>단위 전환</span></div>
-  <div><kbd>↑</kbd><span>이 도움말</span></div>
-  <div><kbd>↓</kbd><span>기록 초기화</span></div>
-  <div><kbd>중지 핀치</kbd><span>닫기</span></div>
-</div>
 
 <script>
 "use strict";
 
 /* ────────────────────────────────────────────────────────────
-   뉴럴 밴드는 표준 키보드 이벤트로 들어옵니다.
-     검지 핀치 = Enter · 중지 핀치 = Escape · 스와이프 = Arrow*
-   위치는 안경이 아니라 "페어링된 폰"의 GPS에서 옵니다.
-   안경 자체에는 위치 센서가 없습니다.
+   뉴럴 밴드 = 표준 키보드 이벤트
+     검지 핀치 Enter · 중지 핀치 Escape · 엄지 스와이프 Arrow*
+
+   속도 출처 두 가지
+     1) GPS       — 페어링된 폰에서 옴. 안경에는 위치 센서가 없음.
+     2) 보폭 추정  — 케이던스 x 보폭. GPS가 잡힐 때 보폭을 자동 학습해 두고
+                    GPS가 끊기면(실내·터널·빌딩 사이) 이걸로 이어감.
+                    가속도를 적분하지 않으므로 드리프트가 누적되지 않음.
    ──────────────────────────────────────────────────────────── */
 
-var UNITS = ["kmh", "ms", "pace"];
+var UNITS = ["kmh", "ms"];
 var unitIdx = 0;
-try { var saved = localStorage.getItem("speedhud.unit"); if (saved !== null) unitIdx = +saved || 0; } catch (e) {}
+var strideLen = null;               // m, GPS로 학습한 보폭
+try {
+  var u = localStorage.getItem("speedhud.unit");   if (u !== null) unitIdx = +u ? 1 : 0;
+  var s = localStorage.getItem("speedhud.stride"); if (s !== null) strideLen = +s || null;
+} catch (e) {}
 
-var state = "idle";          // idle | asking | tracking | paused | error
+var state = "idle";                 // idle | asking | tracking | error
 var errMsg = "";
 var watchId = null;
 
-var speed = 0;               // m/s, 평활화된 값
-var rawAt = 0;               // 마지막 갱신 시각
-var acc = null;              // GPS 정확도(m)
-var maxSpeed = 0;
-var distance = 0;            // m
-var movingMs = 0;            // 실제 이동 시간(정지 구간 제외)
-var lastFix = null;
-var cadence = 0;             // spm
+var speed = 0, source = "none";     // m/s · gps | stride | none
+var acc = null, lastFix = null;
+var maxSpeed = 0, distance = 0, movingMs = 0;
+var cadence = 0;
+var showUntil = 0;                  // 이 시각까지 화면을 켜 둠
 
-/* ── 속도 계산 ───────────────────────────────────────────────
-   coords.speed 는 기기·브라우저에 따라 null 로 옵니다.
-   그래서 연속 좌표 간 거리로 직접 계산하는 경로를 항상 함께 둡니다. */
+var SHOW_MS = 3000;                 // 핀치 1회당 표시 시간
+
+/* ── GPS ─────────────────────────────────────────────────── */
 function haversine(a, b) {
   var R = 6371000, t = Math.PI / 180;
   var dLat = (b.lat - a.lat) * t, dLon = (b.lon - a.lon) * t;
-  var la1 = a.lat * t, la2 = b.lat * t;
   var h = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+          Math.cos(a.lat * t) * Math.cos(b.lat * t) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
@@ -103,45 +93,46 @@ function onFix(pos) {
   acc = c.accuracy;
 
   var inst = null;
-  if (c.speed !== null && c.speed !== undefined && c.speed >= 0 && !isNaN(c.speed)) {
-    inst = c.speed;
-  }
+  if (c.speed !== null && c.speed !== undefined && c.speed >= 0 && !isNaN(c.speed)) inst = c.speed;
 
   var fix = { lat: c.latitude, lon: c.longitude, t: now };
   if (lastFix) {
     var dt = (now - lastFix.t) / 1000;
     if (dt > 0.2) {
       var d = haversine(lastFix, fix);
-      // 정확도보다 작은 이동은 GPS 지터로 보고 버립니다.
-      if (d > Math.max(3, (acc || 10) * 0.5)) {
+      if (d > Math.max(3, (acc || 10) * 0.5)) {      // 정확도 이하 이동은 지터로 폐기
         if (inst === null) inst = d / dt;
-        distance += d;
-        movingMs += dt * 1000;
-      } else if (inst === null) {
-        inst = 0;
-      }
+        distance += d; movingMs += dt * 1000;
+      } else if (inst === null) inst = 0;
     }
   }
   lastFix = fix;
 
-  if (inst !== null) {
-    // 지수이동평균. GPS 속도는 튀기 때문에 평활화 없이는 못 읽습니다.
-    speed = speed === 0 ? inst : speed * 0.7 + inst * 0.3;
-    if (speed < 0.4) speed = 0;              // 정지 판정
+  if (inst !== null && acc !== null && acc <= 30) {
+    speed = speed === 0 ? inst : speed * 0.7 + inst * 0.3;   // 지수이동평균
+    if (speed < 0.4) speed = 0;
     if (speed > maxSpeed) maxSpeed = speed;
-    rawAt = Date.now();
+    source = "gps";
+    learnStride();
   }
-  render();
+}
+
+/* 보폭 학습 — GPS가 믿을 만하고 실제로 걷고 있을 때만 */
+function learnStride() {
+  if (acc === null || acc > 15) return;
+  if (cadence < 40 || speed < 0.8) return;
+  var observed = speed * 60 / cadence;
+  if (observed < 0.3 || observed > 2.5) return;            // 비현실적 값 폐기
+  strideLen = strideLen === null ? observed : strideLen * 0.9 + observed * 0.1;
+  try { localStorage.setItem("speedhud.stride", strideLen.toFixed(3)); } catch (e) {}
 }
 
 function onFixErr(e) {
   if (e.code === 1) { state = "error"; errMsg = "위치 권한이 거부되었습니다"; }
-  else { acc = null; }                       // 일시적 신호 없음은 추적을 유지
-  render();
+  else acc = null;                                          // 신호 없음 — 추적은 유지
 }
 
-/* ── 케이던스 (GPS 없이 IMU만으로 동작) ──────────────────────
-   터널이나 건물 사이에서 GPS가 끊겨도 이건 계속 돕니다. */
+/* ── 케이던스 (IMU만, GPS 불필요) ────────────────────────── */
 var steps = [], lastPeak = 0;
 function onMotion(e) {
   var a = e.accelerationIncludingGravity;
@@ -150,43 +141,56 @@ function onMotion(e) {
   var now = Date.now();
   if (m > 13 && now - lastPeak > 250) { lastPeak = now; steps.push(now); }
   while (steps.length && now - steps[0] > 10000) steps.shift();
-  cadence = Math.round(steps.length * 6);    // 10초 창 → 분당
+  cadence = Math.round(steps.length * 6);                   // 10초 창 → 분당
 }
 
-/* ── 표시 변환 ─────────────────────────────────────────────── */
-function fmtSpeed(mps) {
-  if (UNITS[unitIdx] === "ms")  return { v: mps.toFixed(1), u: "m/s" };
-  if (UNITS[unitIdx] === "kmh") return { v: (mps * 3.6).toFixed(1), u: "km/h" };
-  if (mps < 0.5) return { v: "--:--", u: "/km" };
-  var sec = 1000 / mps, mm = Math.floor(sec / 60), ss = Math.round(sec % 60);
-  if (ss === 60) { mm++; ss = 0; }
-  if (mm > 99) return { v: "--:--", u: "/km" };
-  return { v: mm + ":" + (ss < 10 ? "0" : "") + ss, u: "/km" };
+/* GPS가 죽었을 때 보폭 추정으로 넘어감 */
+function fallback() {
+  var gpsStale = acc === null || acc > 30 || (lastFix && Date.now() - lastFix.t > 5000);
+  if (!gpsStale) return;
+  if (cadence >= 40 && strideLen) {
+    var est = cadence * strideLen / 60;
+    speed = speed === 0 ? est : speed * 0.7 + est * 0.3;
+    if (speed > maxSpeed) maxSpeed = speed;
+    source = "stride";
+  } else {
+    speed = 0;                    // 신호도 걸음도 없으면 정지로 봅니다
+    source = "none";
+  }
+}
+
+/* ── 표시 ───────────────────────────────────────────────── */
+function fmt(mps) {
+  return UNITS[unitIdx] === "ms"
+    ? { v: mps.toFixed(1), u: "m/s" }
+    : { v: (mps * 3.6).toFixed(1), u: "km/h" };
 }
 function fmtTime(ms) {
   var t = Math.floor(ms / 1000), m = Math.floor(t / 60), s = t % 60;
   return m + ":" + (s < 10 ? "0" : "") + s;
 }
-function sigInfo() {
-  if (acc === null) return { c: "none", t: "없음" };
-  if (acc <= 12)    return { c: "",     t: "양호" };
-  if (acc <= 35)    return { c: "weak", t: "보통" };
-  return { c: "none", t: "약함" };
+function srcInfo() {
+  if (source === "gps")    return { c: "gps",    t: "GPS" };
+  if (source === "stride") return { c: "stride", t: "보폭" };
+  return { c: "none", t: "신호없음" };
 }
 
-/* ── 렌더 ───────────────────────────────────────────────────
-   화면 전체를 매초 다시 그립니다. 값이 계속 바뀌므로
-   20초 디밍 타이머에 걸리지 않습니다. */
 function render() {
   var app = document.getElementById("app");
+  var lit = Date.now() < showUntil;
+
+  // 추적 중 + 소등 시간 → 완전 검정
+  if (state === "tracking" && !lit) { app.className = "dark"; return; }
+  app.className = "";
 
   if (state === "idle") {
     app.innerHTML =
       '<div class="bar"><span>SPEED HUD</span><span></span></div>' +
       '<div class="card"><h1>이동 속도</h1>' +
-      '<p>위치는 페어링된 폰의 GPS를 사용합니다.<br>폰을 지니고 계셔야 합니다.</p>' +
+      '<p>GPS는 페어링된 폰에서 옵니다.<br>신호가 끊기면 보폭 추정으로 이어집니다.</p>' +
       '<p class="hint">검지 핀치로 시작</p></div>' +
-      '<div class="bar"><span>← → 단위</span><span>↑ 도움말</span></div>';
+      '<div class="bar"><span>엄지 스와이프 · 단위</span><span>' +
+        (strideLen ? "보폭 " + strideLen.toFixed(2) + "m" : "보폭 미학습") + '</span></div>';
     return;
   }
   if (state === "asking") {
@@ -201,36 +205,32 @@ function render() {
     return;
   }
 
-  var f = fmtSpeed(speed), sig = sigInfo();
-  var stale = Date.now() - rawAt > 4000;      // 4초 넘게 갱신 없으면 흐리게
+  var f = fmt(speed), si = srcInfo();
   var avg = movingMs > 1000 ? distance / (movingMs / 1000) : 0;
 
   app.innerHTML =
     '<div class="bar">' +
-      '<span class="sig ' + sig.c + '">GPS <b>' + sig.t + '</b>' +
-        (acc !== null ? " " + Math.round(acc) + "m" : "") + '</span>' +
-      '<span>' + (state === "paused" ? "일시정지" : fmtTime(movingMs)) + '</span>' +
+      '<span class="src ' + si.c + '"><b>' + si.t + '</b>' +
+        (source === "gps" && acc !== null ? " " + Math.round(acc) + "m" : "") + '</span>' +
+      '<span>' + fmtTime(movingMs) + '</span>' +
     '</div>' +
-    '<div class="mid">' +
-      '<div id="val" class="' + (stale || state === "paused" ? "stale" : "") + '">' + f.v + '</div>' +
-      '<div id="unit">' + f.u + '</div>' +
-    '</div>' +
+    '<div class="mid"><div id="val">' + f.v + '</div><div id="unit">' + f.u + '</div></div>' +
     '<div class="sub">' +
-      '<div><span>평균</span><b>' + fmtSpeed(avg).v + '</b></div>' +
-      '<div><span>최고</span><b>' + fmtSpeed(maxSpeed).v + '</b></div>' +
+      '<div><span>평균</span><b>' + fmt(avg).v + '</b></div>' +
+      '<div><span>최고</span><b>' + fmt(maxSpeed).v + '</b></div>' +
       '<div><span>거리</span><b>' + (distance / 1000).toFixed(2) + ' km</b></div>' +
       '<div><span>케이던스</span><b>' + (cadence || "--") + ' spm</b></div>' +
     '</div>';
 }
 
-/* ── 시작 · 정지 ────────────────────────────────────────────── */
+/* 핀치나 스와이프가 있을 때만 3초간 화면을 켭니다 */
+function flash() { showUntil = Date.now() + SHOW_MS; render(); }
+
+/* ── 시작 · 정지 ────────────────────────────────────────── */
 function start() {
-  if (!navigator.geolocation) {
-    state = "error"; errMsg = "이 기기에서 위치를 쓸 수 없습니다"; return render();
-  }
+  if (!navigator.geolocation) { state = "error"; errMsg = "이 기기에서 위치를 쓸 수 없습니다"; return render(); }
   state = "asking"; render();
 
-  // 모션 권한은 실패해도 진행합니다. 케이던스만 포기하면 됩니다.
   try {
     if (typeof DeviceMotionEvent !== "undefined" &&
         typeof DeviceMotionEvent.requestPermission === "function") {
@@ -243,55 +243,54 @@ function start() {
   } catch (e) {}
 
   watchId = navigator.geolocation.watchPosition(function (p) {
-    if (state !== "tracking") state = "tracking";
+    if (state === "asking") { state = "tracking"; flash(); }
     onFix(p);
   }, onFixErr, { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 });
+
+  // GPS가 한 번도 안 잡혀도 보폭 추정으로 시작할 수 있게
+  setTimeout(function () { if (state === "asking") { state = "tracking"; flash(); } }, 4000);
 }
 
 function stop() {
   if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
   window.removeEventListener("devicemotion", onMotion);
-}
-
-function reset() {
+  state = "idle";
   speed = 0; maxSpeed = 0; distance = 0; movingMs = 0;
-  lastFix = null; steps = []; cadence = 0;
+  lastFix = null; steps = []; cadence = 0; source = "none"; acc = null;
+  showUntil = 0;
   render();
 }
 
-/* ── 입력 ───────────────────────────────────────────────────── */
-var help = document.getElementById("help");
-
+/* ── 입력 ───────────────────────────────────────────────── */
 document.addEventListener("keydown", function (e) {
   var k = e.key;
 
-  if (help.classList.contains("on")) {
-    if (k === "Escape" || k === "Enter" || k === "ArrowUp") help.classList.remove("on");
-    e.preventDefault(); return;
-  }
-
-  if (k === "Enter") {                                   // 검지 핀치
+  if (k === "Enter") {                                    // 검지 핀치 — 3초 표시
     if (state === "idle" || state === "error") start();
-    else if (state === "tracking") { state = "paused"; stop(); render(); }
-    else if (state === "paused") { state = "tracking"; start(); }
+    else flash();
     e.preventDefault();
-  } else if (k === "ArrowLeft" || k === "ArrowRight") {   // 단위 전환
-    unitIdx = (unitIdx + (k === "ArrowRight" ? 1 : UNITS.length - 1)) % UNITS.length;
+  } else if (k === "ArrowLeft" || k === "ArrowRight") {    // 엄지 스와이프 — 단위 전환
+    unitIdx = unitIdx === 0 ? 1 : 0;
     try { localStorage.setItem("speedhud.unit", unitIdx); } catch (err) {}
-    render(); e.preventDefault();
-  } else if (k === "ArrowUp") {
-    help.classList.add("on"); e.preventDefault();
-  } else if (k === "ArrowDown") {
-    reset(); e.preventDefault();
+    flash();
+    e.preventDefault();
+  } else if (k === "Escape") {                            // 중지 핀치 — 정지
+    if (state === "tracking") stop();
+    e.preventDefault();
   }
 });
 
-// 브라우저에서 테스트할 때를 위한 클릭 대체 입력
+// 브라우저 테스트용 대체 입력
 document.addEventListener("click", function () {
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
 });
 
-setInterval(function () { if (state === "tracking") render(); }, 1000);
+/* 표시 중일 때만 갱신하면 되지만, 소등 판정을 위해 짧은 주기로 돕니다.
+   소등 상태의 render()는 즉시 반환하므로 비용이 거의 없습니다. */
+setInterval(function () {
+  if (state === "tracking") { fallback(); render(); }
+}, 250);
+
 render();
 </script>
 </body>
